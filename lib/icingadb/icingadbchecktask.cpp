@@ -39,6 +39,12 @@ static void ReportIcingadbCheck(
 	}
 }
 
+static inline
+double GetXMessageTs(const Array::Ptr& xMessage)
+{
+	return Convert::ToLong(String(xMessage->Get(0)).Split("-")[0]) / 1000.0;
+}
+
 void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckResult::Ptr& cr,
 	const Dictionary::Ptr& resolvedMacros, bool useResolvedMacros)
 {
@@ -68,6 +74,8 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 	String missingDownForCritical;
 	String missingIdleForWarning;
 	String missingIdleForCritical;
+	String missingHistoryBacklogWarning;
+	String missingHistoryBacklogCritical;
 	String missingQueriesWarning;
 	String missingQueriesCritical;
 	String missingPendingQueriesWarning;
@@ -84,6 +92,12 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 
 	Value idleForCritical = MacroProcessor::ResolveMacros("$icingadb_idlefor_critical$", resolvers, checkable->GetLastCheckResult(),
 	    &missingIdleForCritical, MacroProcessor::EscapeCallback(), resolvedMacros, useResolvedMacros);
+
+	Value historyBacklogWarning = MacroProcessor::ResolveMacros("$icingadb_history_backlog_warning$", resolvers, checkable->GetLastCheckResult(),
+	    &missingHistoryBacklogWarning, MacroProcessor::EscapeCallback(), resolvedMacros, useResolvedMacros);
+
+	Value historyBacklogCritical = MacroProcessor::ResolveMacros("$icingadb_history_backlog_critical$", resolvers, checkable->GetLastCheckResult(),
+	    &missingHistoryBacklogCritical, MacroProcessor::EscapeCallback(), resolvedMacros, useResolvedMacros);
 
 	Value queriesWarning = MacroProcessor::ResolveMacros("$icingadb_queries_warning$", resolvers, checkable->GetLastCheckResult(),
 	    &missingQueriesWarning, MacroProcessor::EscapeCallback(), resolvedMacros, useResolvedMacros);
@@ -119,19 +133,35 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 		return;
 	}
 
-	Array::Ptr xRead;
+	Array::Ptr xReadHeartbeat, xReadHistory;
 
 	try {
-		xRead = redis->GetResultOfQuery(
+		xReadHeartbeat = redis->GetResultOfQuery(
 			{"XREAD", "STREAMS", "icingadb:heartbeat", "0-0"},
 			RedisConnection::QueryPriority::Heartbeat
 		);
 	} catch (const std::exception& ex) {
-		ReportIcingadbCheck(checkable, commandObj, cr, String("XREAD: ") + ex.what(), ServiceCritical);
+		ReportIcingadbCheck(checkable, commandObj, cr, String("XREAD icingadb:heartbeat: ") + ex.what(), ServiceCritical);
 		return;
 	}
 
-	if (!xRead) {
+	try {
+		xReadHistory = redis->GetResultOfQuery(
+			{
+				"XREAD", "COUNT", "1", "STREAMS",
+				"icinga:history:stream:acknowledgement", "icinga:history:stream:comment",
+				"icinga:history:stream:downtime", "icinga:history:stream:flapping",
+				"icinga:history:stream:notification", "icinga:history:stream:state",
+				"0-0", "0-0", "0-0", "0-0", "0-0", "0-0"
+			},
+			RedisConnection::QueryPriority::Heartbeat
+		);
+	} catch (const std::exception& ex) {
+		ReportIcingadbCheck(checkable, commandObj, cr, String("XREAD icinga:history:stream:*: ") + ex.what(), ServiceCritical);
+		return;
+	}
+
+	if (!xReadHeartbeat) {
 		ReportIcingadbCheck(
 			checkable, commandObj, cr,
 			"The Icinga DB daemon seems to have never run. (Missing heartbeat)",
@@ -141,8 +171,8 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 		return;
 	}
 
-	Array::Ptr xReadStream = Array::Ptr(Array::Ptr(xRead->Get(0))->Get(1))->Get(0);
-	auto heartbeatTime (Convert::ToLong(String(xReadStream->Get(0)).Split("-")[0]) / 1000.0);
+	Array::Ptr xReadStream = Array::Ptr(Array::Ptr(xReadHeartbeat->Get(0))->Get(1))->Get(0);
+	auto heartbeatTime (GetXMessageTs(xReadStream));
 	std::map<String, String> heartbeatData;
 
 	IcingaDB::KvsToMap(Array::Ptr(xReadStream->Get(1)), heartbeatData);
@@ -152,6 +182,24 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 	auto now (Utility::GetTime());
 	auto downFor (now - heartbeatTime);
 	auto idleFor ((isResponsible ? -1 : 1) * (now - responsibleSince));
+	double historyBacklog = 0;
+
+	if (xReadHistory) {
+		double minTs = 0;
+		ObjectLock lock (xReadHistory);
+
+		for (Array::Ptr stream : xReadHistory) {
+			auto ts (GetXMessageTs(Array::Ptr(stream->Get(1))->Get(0)));
+
+			if (minTs == 0 || ts < minTs) {
+				minTs = ts;
+			}
+		}
+
+		if (minTs > 0) {
+			historyBacklog = now - minTs;
+		}
+	}
 
 	std::ostringstream msgbuf;
 	double qps = redis->GetQueryCount(60) / 60.0;
@@ -162,7 +210,8 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 	    << " Pending queries: " << std::fixed << std::setprecision(3) << pendingQueries
 	    << " Icinga DB daemon last seen: " << std::fixed << std::setprecision(3) << downFor << " seconds ago"
 	    << " Icinga DB daemon" << (isResponsible ? "" : " not") << " responsible for: "
-	    << std::fixed << std::setprecision(3) << (now - responsibleSince) << " seconds";
+	    << std::fixed << std::setprecision(3) << (now - responsibleSince) << " seconds"
+	    << " Icinga DB daemon's history backlog: " << std::fixed << std::setprecision(3) << historyBacklog << " seconds";
 
 	/* Check whether the thresholds have been defined and match. */
 
@@ -186,6 +235,20 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 	} else if (missingIdleForWarning.IsEmpty() && idleFor > (double)idleForWarning) {
 		msgbuf << " Icinga DB daemon is not responsible for " << idleFor << " seconds greater than warning threshold ("
 		    << idleForWarning << " seconds).";
+
+		if (state == ServiceOK) {
+			state = ServiceWarning;
+		}
+	}
+
+	if (missingHistoryBacklogCritical.IsEmpty() && historyBacklog > (double)historyBacklogCritical) {
+		msgbuf << " Icinga DB daemon's history backlog of " << historyBacklog << " seconds greater than critical threshold ("
+		    << historyBacklogCritical << " seconds).";
+
+		state = ServiceCritical;
+	} else if (missingHistoryBacklogWarning.IsEmpty() && historyBacklog > (double)historyBacklogWarning) {
+		msgbuf << " Icinga DB daemon's history backlog of " << historyBacklog << " seconds greater than warning threshold ("
+		    << historyBacklogWarning << " seconds).";
 
 		if (state == ServiceOK) {
 			state = ServiceWarning;
@@ -225,7 +288,8 @@ void IcingadbCheckTask::ScriptFunc(const Checkable::Ptr& checkable, const CheckR
 		{ new PerfdataValue("queries_15mins", redis->GetQueryCount(15 * 60), Empty, Empty, 0) },
 		{ new PerfdataValue("pending_queries", pendingQueries, false, "", pendingQueriesWarning, pendingQueriesCritical, 0) },
 		{ new PerfdataValue("down_for", downFor, false, "seconds", downForWarning, downForCritical, 0) },
-		{ new PerfdataValue("idle_for", idleFor, false, "seconds", idleForWarning, idleForCritical) }
+		{ new PerfdataValue("idle_for", idleFor, false, "seconds", idleForWarning, idleForCritical) },
+		{ new PerfdataValue("history_backlog", historyBacklog, false, "seconds", historyBacklogWarning, historyBacklogCritical, 0) }
 	}));
 
 	ReportIcingadbCheck(checkable, commandObj, cr, msgbuf.str(), state);
