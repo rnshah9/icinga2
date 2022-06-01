@@ -481,6 +481,150 @@ Restart Icinga 2 for these changes to take effect.
 systemctl restart icinga2
 ```
 
+<!-- {% if amazon_linux or centos or debian or rhel or sles or ubuntu %} -->>
+## Set up Icinga DB <a id="setting-up-icingadb"></a>
+
+Icinga DB is a set of components for publishing, synchronizing and visualizing monitoring data in the Icinga ecosystem.
+Icinga 2 is responsible for the publishing part to make configuration, state, and history items available to Icinga Web.
+
+![Icinga DB Architecture](images/installation/icingadb-architecture.png)
+
+!!! info
+
+    Setting up Icinga DB is only required for Icinga master nodes or single-node setups.
+
+### Set up Redis Server <a id="setting-up-redis-server"></a>
+
+A Redis server from version 6.2 is required. Icinga provides the `icingadb-redis` package,
+which ships a current Redis Server version and is preconfigured for the Icinga DB components.
+
+![Icinga DB Redis](images/installation/icingadb-redis.png)
+
+!!! tip
+
+    Although the Redis server can run anywhere in your infrastructure,
+    we recommend installing it on the node running the corresponding Icinga 2 node to
+    keep latency between the components low.
+
+!!! info
+
+    Using own Redis server setups is supported as long as the version requirements are met.
+
+#### Install Icinga DB Redis <a id="installing-icingadb-redis"></a>
+
+Install Icinga DB Redis by using the distribution's package manager to install the `icingadb-redis` package as follows:
+
+<!-- {% if amazon_linux %} -->
+<!-- {% if not icingaDocs %} -->
+##### Amazon Linux 2
+<!-- {% endif %} -->
+```bash
+yum install icingadb-redis
+```
+<!-- {% endif %} -->
+
+<!-- {% if centos %} -->
+##### CentOS
+
+!!! info
+
+    Note that installing Icinga DB Redis is only supported on CentOS 7 as CentOS 8 is EOL.
+
+```bash
+yum install icingadb-redis
+```
+<!-- {% endif %} -->
+
+<!-- {% if debian or ubuntu %} -->
+<!-- {% if not icingaDocs %} -->
+##### Debian / Ubuntu
+<!-- {% endif %} -->
+```bash
+apt-get install icingadb-redis
+```
+<!-- {% endif %} -->
+
+<!-- {% if rhel %} -->
+##### RHEL 8
+
+```bash
+dnf install icingadb-redis
+```
+
+##### RHEL 7
+
+```bash
+yum install icingadb-redis
+```
+<!-- {% endif %} -->
+
+<!-- {% if sles %} -->
+<!-- {% if not icingaDocs %} -->
+##### SLES
+<!-- {% endif %} -->
+```bash
+zypper install icingadb-redis
+```
+<!-- {% endif %} -->
+
+#### Run Icinga DB Redis <a id="running-icingadb-redis"></a>
+
+The `icingadb-redis` package automatically installs the necessary systemd unit files to run Icinga DB Redis.
+Please run the following command to enable and start its service:
+
+```bash
+systemctl enable --now icingadb-redis
+```
+
+#### Enable Remote Redis Connections <a id="enabling-remote-redis-connections"></a>
+
+By default, `icingadb-redis` only listens on `127.0.0.1`. If Icinga Web or Icinga 2 is running on another node,
+remote access to the Redis server must be allowed. This requires the following configuration directives to be set in
+the `/etc/icingadb-redis/icingadb-redis.conf` configuration file:
+
+* Set `protected-mode` to `no`, i.e. `protected-mode no`
+* Set `bind` to the desired binding interface or bind all interfaces, e.g. `bind 0.0.0.0`
+
+!!! warning
+
+    By default, Redis has no authentication preventing others from accessing it.
+    When opening Redis to an external interface, make sure to set a password, set up appropriate firewall rules,
+    or configure TLS with certificate authentication on Redis and its consumers,
+    i.e. Icinga 2, Icinga DB and Icinga Web.
+
+Restart Icinga DB Redis for these changes to take effect:
+
+```bash
+systemctl restart icingadb-redis
+```
+
+### Enable Icinga DB feature <a id="enabling-icinga-db"></a>
+
+With the [Icinga DB feature](https://icinga.com/docs/icinga-2/latest/doc/14-features/#icinga-db) enabled,
+Icinga 2 publishes all of its monitoring data to the Redis server. This includes configuration and
+its runtime updates via the Icinga 2 API, check results, state changes, downtimes, acknowledgments, notifications and
+other events such as flapping.
+
+![Icinga DB Icinga 2](images/installation/icingadb-icinga2.png)
+
+Icinga 2 installs the feature configuration file to `/etc/icinga2/features-available/icingadb.conf`,
+pre-configured for a single-node setup.
+Update this file in case Redis is running on a different host or to set credentials.
+All available settings are explained in the [Icinga DB object](09-object-types.md#objecttype-icingadb) chapter.
+
+Enable the `icingadb` feature using the following command:
+
+```bash
+icinga2 feature enable icingadb
+```
+
+Restart Icinga 2 for these changes to take effect:
+
+```bash
+systemctl restart icinga2
+```
+<!-- {% endif %} -->
+
 ## Set up Database <a id="set-up-database"></a>
 
 The IDO (Icinga Data Output) feature for Icinga 2 stores all configuration and status information into a database.
@@ -903,45 +1047,6 @@ Enable the `ido-pgsql` feature configuration file using the `icinga2` command:
 ```
 # icinga2 feature enable ido-pgsql
 Module 'ido-pgsql' was enabled.
-Make sure to restart Icinga 2 for these changes to take effect.
-```
-
-Restart Icinga 2.
-
-```bash
-systemctl restart icinga2
-```
-
-### Icinga DB <a id="icingadb"></a>
-
-Icinga DB is a new data backend currently in development.
-It's purpose is to synchronise data between Icinga 2 (Redis) and Icinga Web 2 (MySQL), some day replacing the IDO.
-Don't worry, we won't drop support on the IDO any time soon.
-
-!!! note
-
-    Icinga DB is not ready to be used in production and should only be used for testing purposes.
-
-#### Configue Icinga DB <a id="configuring-icinga-db"></a>
-
-First, make sure to setup Icinga DB itself and its database backends (Redis and MySQL) by following the [installation instructions](https://icinga.com/docs/icingadb/latest/doc/02-Installation/).
-
-#### Enable Icinga DB feature <a id="enabling-icinga-db"></a>
-
-Icinga 2 provides a configuration file that is installed in
-`/etc/icinga2/features-available/icingadb.conf`. You can update
-the Redis credentials in this file.
-
-All available attributes are explained in the
-[IcingaDB object](09-object-types.md#objecttype-icingadb)
-chapter.
-
-You can enable the `icingadb` feature configuration file using
-`icinga2 feature enable`:
-
-```
-# icinga2 feature enable icingadb
-Module 'icingadb' was enabled.
 Make sure to restart Icinga 2 for these changes to take effect.
 ```
 
