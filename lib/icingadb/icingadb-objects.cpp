@@ -166,10 +166,16 @@ void IcingaDB::ConfigStaticInitialize()
 void IcingaDB::UpdateAllConfigObjects()
 {
 	m_Rcon->Sync();
-	m_Rcon->FireAndForgetQuery({"XADD", "icinga:schema", "MAXLEN", "1", "*", "version", "4"}, Prio::Heartbeat);
+	m_Rcon->FireAndForgetQuery({"XADD", "icinga:schema", "MAXLEN", "1", "*", "version", "5"}, Prio::Heartbeat);
 
 	Log(LogInformation, "IcingaDB") << "Starting initial config/status dump";
 	double startTime = Utility::GetTime();
+
+	SetOngoingDumpStart(startTime);
+
+	Defer resetOngoingDumpStart ([this]() {
+		SetOngoingDumpStart(0);
+	});
 
 	// Use a Workqueue to pack objects in parallel
 	WorkQueue upq(25000, Configuration::Concurrency, LogNotice);
@@ -230,18 +236,7 @@ void IcingaDB::UpdateAllConfigObjects()
 					"HSCAN", configCheckSum, cursor, "COUNT", "1000"
 				}, Prio::Config);
 
-				Array::Ptr kvs = res->Get(1);
-				Value* key = nullptr;
-				ObjectLock oLock (kvs);
-
-				for (auto& kv : kvs) {
-					if (key) {
-						redisCheckSums.emplace(std::move(*key), std::move(kv));
-						key = nullptr;
-					} else {
-						key = &kv;
-					}
-				}
+				AddKvsToMap(res->Get(1), redisCheckSums);
 
 				cursor = res->Get(0);
 			} while (cursor != "0");
@@ -413,6 +408,8 @@ void IcingaDB::UpdateAllConfigObjects()
 		auto ourEnd (ourCheckSums.end());
 
 		auto flushSets ([&]() {
+			auto affectedConfig (setObject.size() / 2u);
+
 			setChecksum.insert(setChecksum.begin(), {"HMSET", configCheckSum});
 			setObject.insert(setObject.begin(), {"HMSET", configObject});
 
@@ -426,10 +423,12 @@ void IcingaDB::UpdateAllConfigObjects()
 			setChecksum.clear();
 			setObject.clear();
 
-			rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+			rcon->FireAndForgetQueries(std::move(transaction), Prio::Config, {affectedConfig});
 		});
 
 		auto flushDels ([&]() {
+			auto affectedConfig (delObject.size());
+
 			delChecksum.insert(delChecksum.begin(), {"HDEL", configCheckSum});
 			delObject.insert(delObject.begin(), {"HDEL", configObject});
 
@@ -443,7 +442,7 @@ void IcingaDB::UpdateAllConfigObjects()
 			delChecksum.clear();
 			delObject.clear();
 
-			rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+			rcon->FireAndForgetQueries(std::move(transaction), Prio::Config, {affectedConfig});
 		});
 
 		auto setOne ([&]() {
@@ -535,8 +534,14 @@ void IcingaDB::UpdateAllConfigObjects()
 	m_Rcon->EnqueueCallback([&p](boost::asio::yield_context& yc) { p.set_value(); }, Prio::Config);
 	p.get_future().wait();
 
+	auto endTime (Utility::GetTime());
+	auto took (endTime - startTime);
+
+	SetLastdumpTook(took);
+	SetLastdumpEnd(endTime);
+
 	Log(LogInformation, "IcingaDB")
-			<< "Initial config/status dump finished in " << Utility::GetTime() - startTime << " seconds.";
+		<< "Initial config/status dump finished in " << took << " seconds.";
 }
 
 std::vector<std::vector<intrusive_ptr<ConfigObject>>> IcingaDB::ChunkObjects(std::vector<intrusive_ptr<ConfigObject>> objects, size_t chunkSize) {
@@ -1142,7 +1147,7 @@ void IcingaDB::UpdateState(const Checkable::Ptr& checkable, StateUpdate mode)
 			streamadd.emplace_back(IcingaToStreamValue(kv.second));
 		}
 
-		m_Rcon->FireAndForgetQuery(std::move(streamadd), Prio::RuntimeStateStream);
+		m_Rcon->FireAndForgetQuery(std::move(streamadd), Prio::RuntimeStateStream, {0, 1});
 	}
 }
 
@@ -1189,7 +1194,7 @@ void IcingaDB::SendConfigUpdate(const ConfigObject::Ptr& object, bool runtimeUpd
 
 	if (transaction.size() > 1) {
 		transaction.push_back({"EXEC"});
-		m_Rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+		m_Rcon->FireAndForgetQueries(std::move(transaction), Prio::Config, {1});
 	}
 
 	if (checkable) {
@@ -1226,7 +1231,7 @@ bool IcingaDB::PrepareObject(const ConfigObject::Ptr& object, Dictionary::Ptr& a
 
 	if (ObjectsZone) {
 		attributes->Set("zone_id", GetObjectIdentifier(ObjectsZone));
-		attributes->Set("zone", ObjectsZone->GetName());
+		attributes->Set("zone_name", ObjectsZone->GetName());
 	}
 
 	if (type == Endpoint::TypeInstance) {
@@ -1252,7 +1257,7 @@ bool IcingaDB::PrepareObject(const ConfigObject::Ptr& object, Dictionary::Ptr& a
 	if (type == Host::TypeInstance || type == Service::TypeInstance) {
 		Checkable::Ptr checkable = static_pointer_cast<Checkable>(object);
 
-		attributes->Set("checkcommand", checkable->GetCheckCommand()->GetName());
+		attributes->Set("checkcommand_name", checkable->GetCheckCommand()->GetName());
 		attributes->Set("max_check_attempts", checkable->GetMaxCheckAttempts());
 		attributes->Set("check_timeout", checkable->GetCheckTimeout());
 		attributes->Set("check_interval", checkable->GetCheckInterval());
@@ -1274,19 +1279,19 @@ bool IcingaDB::PrepareObject(const ConfigObject::Ptr& object, Dictionary::Ptr& a
 		Endpoint::Ptr commandEndpoint = checkable->GetCommandEndpoint();
 		if (commandEndpoint) {
 			attributes->Set("command_endpoint_id", GetObjectIdentifier(commandEndpoint));
-			attributes->Set("command_endpoint", commandEndpoint->GetName());
+			attributes->Set("command_endpoint_name", commandEndpoint->GetName());
 		}
 
 		TimePeriod::Ptr timePeriod = checkable->GetCheckPeriod();
 		if (timePeriod) {
 			attributes->Set("check_timeperiod_id", GetObjectIdentifier(timePeriod));
-			attributes->Set("check_timeperiod", timePeriod->GetName());
+			attributes->Set("check_timeperiod_name", timePeriod->GetName());
 		}
 
 		EventCommand::Ptr eventCommand = checkable->GetEventCommand();
 		if (eventCommand) {
 			attributes->Set("eventcommand_id", GetObjectIdentifier(eventCommand));
-			attributes->Set("eventcommand", eventCommand->GetName());
+			attributes->Set("eventcommand_name", eventCommand->GetName());
 		}
 
 		String actionUrl = checkable->GetActionUrl();
@@ -1665,7 +1670,7 @@ void IcingaDB::SendStateChange(const ConfigObject::Ptr& object, const CheckResul
 		"state_type", Convert::ToString(type),
 		"soft_state", Convert::ToString(cr ? service ? Convert::ToLong(cr->GetState()) : Convert::ToLong(Host::CalculateState(cr->GetState())) : 99),
 		"hard_state", Convert::ToString(hard_state),
-		"attempt", Convert::ToString(checkable->GetCheckAttempt()),
+		"check_attempt", Convert::ToString(checkable->GetCheckAttempt()),
 		"previous_soft_state", Convert::ToString(GetPreviousState(checkable, service, StateTypeSoft)),
 		"previous_hard_state", Convert::ToString(GetPreviousState(checkable, service, StateTypeHard)),
 		"max_check_attempts", Convert::ToString(checkable->GetMaxCheckAttempts()),
@@ -2354,7 +2359,7 @@ void IcingaDB::ForwardHistoryEntries()
 
 			if (m_Rcon && m_Rcon->IsConnected()) {
 				try {
-					m_Rcon->GetResultsOfQueries(haystack, Prio::History);
+					m_Rcon->GetResultsOfQueries(haystack, Prio::History, {0, 0, haystack.size()});
 					break;
 				} catch (const std::exception& ex) {
 					logFailure(ex.what());
@@ -2548,14 +2553,14 @@ Dictionary::Ptr IcingaDB::SerializeState(const Checkable::Ptr& checkable)
 	if (service) {
 		attrs->Set("service_id", id);
 		auto state = service->HasBeenChecked() ? service->GetState() : 99;
-		attrs->Set("state", state);
+		attrs->Set("soft_state", state);
 		attrs->Set("hard_state", service->HasBeenChecked() ? service->GetLastHardState() : 99);
 		attrs->Set("severity", service->GetSeverity());
 		attrs->Set("host_id", GetObjectIdentifier(host));
 	} else {
 		attrs->Set("host_id", id);
 		auto state = host->HasBeenChecked() ? host->GetState() : 99;
-		attrs->Set("state", state);
+		attrs->Set("soft_state", state);
 		attrs->Set("hard_state", host->HasBeenChecked() ? host->GetLastHardState() : 99);
 		attrs->Set("severity", host->GetSeverity());
 	}
@@ -2592,7 +2597,7 @@ Dictionary::Ptr IcingaDB::SerializeState(const Checkable::Ptr& checkable)
 			attrs->Set("normalized_performance_data", normedPerfData);
 
 		if (!cr->GetCommand().IsEmpty())
-			attrs->Set("commandline", FormatCommandLine(cr->GetCommand()));
+			attrs->Set("check_commandline", FormatCommandLine(cr->GetCommand()));
 		attrs->Set("execution_time", TimestampToMilliseconds(fmax(0.0, cr->CalculateExecutionTime())));
 		attrs->Set("latency", TimestampToMilliseconds(cr->CalculateLatency()));
 		attrs->Set("check_source", cr->GetCheckSource());
@@ -2604,7 +2609,7 @@ Dictionary::Ptr IcingaDB::SerializeState(const Checkable::Ptr& checkable)
 	attrs->Set("is_reachable", checkable->IsReachable());
 	attrs->Set("is_flapping", checkable->IsFlapping());
 
-	attrs->Set("acknowledgement", checkable->GetAcknowledgement());
+	attrs->Set("is_acknowledged", checkable->GetAcknowledgement());
 	if (checkable->IsAcknowledged()) {
 		Timestamp entry = 0;
 		Comment::Ptr AckComment;

@@ -5,6 +5,7 @@
 
 #include "icingadb/icingadb-ti.hpp"
 #include "icingadb/redisconnection.hpp"
+#include "base/atomic.hpp"
 #include "base/bulker.hpp"
 #include "base/timer.hpp"
 #include "base/workqueue.hpp"
@@ -37,13 +38,33 @@ public:
 	IcingaDB();
 
 	static void ConfigStaticInitialize();
-	static void StatsFunc(const Dictionary::Ptr& status, const Array::Ptr& perfdata);
 
 	void Validate(int types, const ValidationUtils& utils) override;
 	virtual void Start(bool runtimeCreated) override;
 	virtual void Stop(bool runtimeRemoved) override;
 
 	String GetEnvironmentId() const override;
+
+	inline RedisConnection::Ptr GetConnection()
+	{
+		return m_RconLocked.load();
+	}
+
+	template<class T>
+	static void AddKvsToMap(const Array::Ptr& kvs, T& map)
+	{
+		Value* key = nullptr;
+		ObjectLock oLock (kvs);
+
+		for (auto& kv : kvs) {
+			if (key) {
+				map.emplace(std::move(*key), std::move(kv));
+				key = nullptr;
+			} else {
+				key = &kv;
+			}
+		}
+	}
 
 protected:
 	void ValidateTlsProtocolmin(const Lazy<String>& lvalue, const ValidationUtils& utils) override;
@@ -179,6 +200,9 @@ private:
 
 	static std::vector<Type::Ptr> GetTypes();
 
+	static void InitEnvironmentId();
+	static void PersistEnvironmentId();
+
 	Timer::Ptr m_StatsTimer;
 	WorkQueue m_WorkQueue{0, 1, LogNotice};
 
@@ -192,6 +216,10 @@ private:
 	bool m_ConfigDumpDone;
 
 	RedisConnection::Ptr m_Rcon;
+	// m_RconLocked containes a copy of the value in m_Rcon where all accesses are guarded by a mutex to allow safe
+	// concurrent access like from the icingadb check command. It's a copy to still allow fast access without additional
+	// syncronization to m_Rcon within the IcingaDB feature itself.
+	Locked<RedisConnection::Ptr> m_RconLocked;
 	std::unordered_map<ConfigType*, RedisConnection::Ptr> m_Rcons;
 	std::atomic_size_t m_PendingRcons;
 
@@ -199,8 +227,11 @@ private:
 		DumpedGlobals CustomVar, ActionUrl, NotesUrl, IconImage;
 	} m_DumpedGlobals;
 
+	// m_EnvironmentId is shared across all IcingaDB objects (typically there is at most one, but it is perfectly fine
+	// to have multiple ones). It is initialized once (synchronized using m_EnvironmentIdInitMutex). After successful
+	// initialization, the value is read-only and can be accessed without further synchronization.
 	static String m_EnvironmentId;
-	static std::once_flag m_EnvironmentIdOnce;
+	static std::mutex m_EnvironmentIdInitMutex;
 };
 }
 
